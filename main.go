@@ -80,8 +80,12 @@ func main() {
 	}
 
 	// Generate enums.
-	for _, enum := range enumRegistry.enums {
-		if err := renderEnum(enum); err != nil {
+	for enumName := range enumRegistry.enums {
+		if err := renderEnum(
+			enumName,
+			enumRegistry.enumValues[enumName],
+			enumRegistry.enumNames[enumName],
+		); err != nil {
 			panic(err)
 		}
 	}
@@ -96,14 +100,18 @@ func main() {
 }
 
 type enumRegistry struct {
-	fields map[string]string
-	enums  map[string]string
+	fields     map[string]string
+	enums      map[string]string
+	enumValues map[string][]string
+	enumNames  map[string][]string
 }
 
 func buildEnumRegistry(graph *gen.Graph) *enumRegistry {
 	registry := &enumRegistry{
-		fields: make(map[string]string),
-		enums:  make(map[string]string),
+		fields:     make(map[string]string),
+		enums:      make(map[string]string),
+		enumValues: make(map[string][]string),
+		enumNames:  make(map[string][]string),
 	}
 
 	for _, node := range graph.Nodes {
@@ -124,6 +132,24 @@ func buildEnumRegistry(graph *gen.Graph) *enumRegistry {
 
 			registry.fields[node.Name+"."+f.Name] = enumName
 			registry.enums[enumName] = enumName
+
+			// Keep the actual Ent enum names and values.
+			values := f.EnumValues()
+			names := f.EnumNames()
+
+			if len(values) > 0 {
+				registry.enumValues[enumName] = append(
+					[]string(nil),
+					values...,
+				)
+			}
+
+			if len(names) > 0 {
+				registry.enumNames[enumName] = append(
+					[]string(nil),
+					names...,
+				)
+			}
 		}
 	}
 
@@ -820,12 +846,35 @@ func goCompositeTypeToTS(
 	return "unknown"
 }
 
-func renderEnum(enumName string) error {
+func renderEnum(
+	enumName string,
+	values []string,
+	names []string,
+) error {
 	var b strings.Builder
 
 	b.WriteString("export enum ")
 	b.WriteString(enumName)
 	b.WriteString(" {\n")
+
+	for i, value := range values {
+		enumMember := ""
+
+		if i < len(names) && names[i] != "" {
+			enumMember = names[i]
+		}
+
+		if enumMember == "" {
+			enumMember = enumConstantName(value)
+		}
+
+		b.WriteString("  ")
+		b.WriteString(enumMember)
+		b.WriteString(" = ")
+		b.WriteString(tsString(value))
+		b.WriteString(",\n")
+	}
+
 	b.WriteString("}\n")
 
 	path := filepath.Join(
@@ -838,6 +887,42 @@ func renderEnum(enumName string) error {
 		[]byte(b.String()),
 		0644,
 	)
+}
+
+func enumConstantName(value string) string {
+	if value == "" {
+		return "UNKNOWN"
+	}
+
+	var b strings.Builder
+
+	runes := []rune(value)
+
+	for i, r := range runes {
+		if unicode.IsLetter(r) ||
+			unicode.IsDigit(r) ||
+			r == '_' {
+
+			if i == 0 && unicode.IsDigit(r) {
+				b.WriteRune('_')
+			}
+
+			b.WriteRune(unicode.ToUpper(r))
+			continue
+		}
+
+		b.WriteRune('_')
+	}
+
+	result := b.String()
+
+	result = strings.Trim(result, "_")
+
+	if result == "" {
+		return "UNKNOWN"
+	}
+
+	return result
 }
 
 func renderIndex(
