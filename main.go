@@ -24,111 +24,86 @@ const (
 	mixinDir   = "../frontend/types/mixins"
 )
 
-type importSpec struct {
-	Name string
-	Path string
-}
-
-type enumDefinition struct {
-	Name   string
-	Values []string
-}
-
-type enumRegistry struct {
-	fields      map[string]string
-	definitions map[string]enumDefinition
-}
-
-type mixinDefinition struct {
-	Name       string
-	Fields     []*gen.Field
-	EnumFields []string
-}
-
-type entityMixins map[string][]string
-
 func main() {
 	graph, err := entc.LoadGraph(schemaPath, &gen.Config{})
 	if err != nil {
-		exitErr("load Ent graph", err)
+		panic(err)
 	}
 
-	registry, err := buildEnumRegistry(graph)
-	if err != nil {
-		exitErr("build enum registry", err)
+	enumRegistry := buildEnumRegistry(graph)
+	mixins := discoverMixins(schemaPath)
+
+	// Discover entity mixin usage.
+	entityMixins := make(map[string][]string)
+
+	for _, node := range graph.Nodes {
+		entityMixins[node.Name] = discoverEntityMixins(
+			schemaPath,
+			node.Name,
+		)
 	}
 
-	mixins, err := discoverMixins()
-	if err != nil {
-		exitErr("discover mixins", err)
-	}
-
-	entityMixinMap, err := discoverEntityMixins()
-	if err != nil {
-		exitErr("discover entity mixins", err)
-	}
-
+	// Recreate generated directories.
 	if err := os.RemoveAll(outputDir); err != nil {
-		exitErr("remove old generated types", err)
+		panic(err)
 	}
 
-	if err := os.MkdirAll(outputDir, 0o755); err != nil {
-		exitErr("create output directory", err)
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		panic(err)
 	}
 
-	if err := os.MkdirAll(enumDir, 0o755); err != nil {
-		exitErr("create enum directory", err)
+	if err := os.MkdirAll(enumDir, 0755); err != nil {
+		panic(err)
 	}
 
-	if err := os.MkdirAll(mixinDir, 0o755); err != nil {
-		exitErr("create mixin directory", err)
+	if err := os.MkdirAll(mixinDir, 0755); err != nil {
+		panic(err)
 	}
 
-	if err := generateMixins(mixins, registry); err != nil {
-		exitErr("generate mixins", err)
+	// Generate mixins.
+	for name, mixin := range mixins {
+		if err := renderMixin(mixin, name, enumRegistry); err != nil {
+			panic(err)
+		}
 	}
 
-	if err := generateEntities(
+	// Generate entities.
+	for _, node := range graph.Nodes {
+		if err := renderEntity(
+			node,
+			enumRegistry,
+			entityMixins[node.Name],
+			mixins,
+		); err != nil {
+			panic(err)
+		}
+	}
+
+	// Generate enums.
+	for _, enum := range enumRegistry.enums {
+		if err := renderEnum(enum); err != nil {
+			panic(err)
+		}
+	}
+
+	if err := renderIndex(
 		graph,
-		registry,
-		mixins,
-		entityMixinMap,
-	); err != nil {
-		exitErr("generate entities", err)
-	}
-
-	if err := generateEnums(registry); err != nil {
-		exitErr("generate enums", err)
-	}
-
-	if err := generateIndex(
-		graph,
-		registry,
+		enumRegistry,
 		mixins,
 	); err != nil {
-		exitErr("generate index", err)
+		panic(err)
 	}
 }
 
-func exitErr(action string, err error) {
-	fmt.Fprintf(
-		os.Stderr,
-		"ent-tsgen: %s: %v\n",
-		action,
-		err,
-	)
-
-	os.Exit(1)
+type enumRegistry struct {
+	fields map[string]string
+	enums  map[string]string
 }
 
-// =============================================================================
-// ENUMS
-// =============================================================================
-
-func buildEnumRegistry(graph *gen.Graph) (*enumRegistry, error) {
+func buildEnumRegistry(graph *gen.Graph) *enumRegistry {
 	registry := &enumRegistry{
-		fields:      make(map[string]string),
-		definitions: make(map[string]enumDefinition),
+		fields: make(map[string]string),
+		enums:  make(map[string]string),
 	}
 
 	for _, node := range graph.Nodes {
@@ -137,104 +112,51 @@ func buildEnumRegistry(graph *gen.Graph) (*enumRegistry, error) {
 				continue
 			}
 
-			values := f.EnumValues()
-			name := enumNameForField(node, f)
+			enumName := ""
 
-			key := node.Name + "." + f.Name
-			registry.fields[key] = name
-
-			if existing, ok := registry.definitions[name]; ok {
-				if !sameStrings(existing.Values, values) {
-					return nil, fmt.Errorf(
-						"enum %q has conflicting values between fields; %s.%s has %v but existing definition has %v",
-						name,
-						node.Name,
-						f.Name,
-						values,
-						existing.Values,
-					)
-				}
-
-				continue
+			if f.HasGoType() && f.Type.Ident != "" {
+				enumName = lastIdentifier(f.Type.Ident)
 			}
 
-			registry.definitions[name] = enumDefinition{
-				Name:   name,
-				Values: append([]string(nil), values...),
+			if enumName == "" {
+				enumName = pascalCase(node.Name) + pascalCase(f.Name)
 			}
+
+			registry.fields[node.Name+"."+f.Name] = enumName
+			registry.enums[enumName] = enumName
 		}
 	}
 
-	return registry, nil
+	return registry
 }
 
-func enumNameForField(node *gen.Type, f *gen.Field) string {
-	// Custom Go enum:
-	//
-	// field.Enum("state").
-	//     GoType(types.JobState(""))
-	//
-	// => JobState
-	if f.HasGoType() && f.Type != nil && f.Type.Ident != "" {
-		return lastIdentifier(f.Type.Ident)
-	}
+func discoverMixins(schemaRoot string) map[string]*gen.Type {
+	result := make(map[string]*gen.Type)
 
-	// Normal Ent enum:
-	//
-	// Message.source => MessageSource
-	return pascalCase(node.Name) + pascalCase(f.Name)
-}
-
-// =============================================================================
-// MIXIN DISCOVERY
-// =============================================================================
-
-func discoverMixins() (map[string]*mixinDefinition, error) {
-	result := make(map[string]*mixinDefinition)
-
-	mixinPath := filepath.Join(schemaPath, "mixin")
+	mixinPath := filepath.Join(schemaRoot, "mixin")
 
 	entries, err := os.ReadDir(mixinPath)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return result, nil
-		}
-
-		return nil, err
+		return result
 	}
 
-	fset := token.NewFileSet()
-
 	for _, entry := range entries {
-		if entry.IsDir() {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") {
 			continue
 		}
 
-		if !strings.HasSuffix(entry.Name(), ".go") {
-			continue
-		}
+		path := filepath.Join(mixinPath, entry.Name())
 
-		if strings.HasSuffix(entry.Name(), "_test.go") {
-			continue
-		}
-
-		filename := filepath.Join(
-			mixinPath,
-			entry.Name(),
-		)
+		fset := token.NewFileSet()
 
 		file, err := parser.ParseFile(
 			fset,
-			filename,
+			path,
 			nil,
 			parser.ParseComments,
 		)
 		if err != nil {
-			return nil, fmt.Errorf(
-				"parse mixin %s: %w",
-				filename,
-				err,
-			)
+			continue
 		}
 
 		for _, decl := range file.Decls {
@@ -254,34 +176,29 @@ func discoverMixins() (map[string]*mixinDefinition, error) {
 					continue
 				}
 
-				if !isEntMixinStruct(structType) {
+				if !embedsMixinSchema(structType) {
 					continue
 				}
 
 				name := typeSpec.Name.Name
 
-				result[name] = &mixinDefinition{
+				// Keep the existing architecture.
+				//
+				// The actual mixin fields are discovered separately
+				// from the Fields() method.
+				result[name] = &gen.Type{
 					Name: name,
 				}
 			}
 		}
 	}
 
-	if len(result) > 0 {
-		loadMixinFields(result)
-	}
-
-	return result, nil
+	return result
 }
 
-func isEntMixinStruct(st *ast.StructType) bool {
-	if st.Fields == nil {
-		return false
-	}
-
-	for _, field := range st.Fields.List {
-		// Embedded mixin.Schema.
-		if len(field.Names) > 0 {
+func embedsMixinSchema(structType *ast.StructType) bool {
+	for _, field := range structType.Fields.List {
+		if field.Names != nil {
 			continue
 		}
 
@@ -304,798 +221,219 @@ func isEntMixinStruct(st *ast.StructType) bool {
 	return false
 }
 
-// loadMixinFields resolves mixin fields from the schema source.
-func loadMixinFields(
-	mixins map[string]*mixinDefinition,
-) {
-	mixinPath := filepath.Join(schemaPath, "mixin")
+func discoverEntityMixins(
+	schemaRoot string,
+	entityName string,
+) []string {
+	var result []string
 
-	entries, err := os.ReadDir(mixinPath)
+	path := filepath.Join(
+		schemaRoot,
+		entityName+".go",
+	)
+
+	src, err := os.ReadFile(path)
 	if err != nil {
-		return
+		return result
 	}
 
 	fset := token.NewFileSet()
 
-	for _, entry := range entries {
-		if entry.IsDir() ||
-			!strings.HasSuffix(entry.Name(), ".go") ||
-			strings.HasSuffix(entry.Name(), "_test.go") {
-			continue
-		}
-
-		filename := filepath.Join(
-			mixinPath,
-			entry.Name(),
-		)
-
-		file, err := parser.ParseFile(
-			fset,
-			filename,
-			nil,
-			0,
-		)
-		if err != nil {
-			continue
-		}
-
-		for _, decl := range file.Decls {
-			funcDecl, ok := decl.(*ast.FuncDecl)
-			if !ok {
-				continue
-			}
-
-			if funcDecl.Name.Name != "Fields" ||
-				funcDecl.Recv == nil ||
-				len(funcDecl.Recv.List) != 1 {
-				continue
-			}
-
-			receiverName := receiverTypeName(
-				funcDecl.Recv.List[0].Type,
-			)
-
-			mixin, ok := mixins[receiverName]
-			if !ok {
-				continue
-			}
-
-			for _, name := range extractFieldNames(funcDecl) {
-				mixin.Fields = append(
-					mixin.Fields,
-					&gen.Field{
-						Name: name,
-					},
-				)
-			}
-		}
-	}
-}
-
-func receiverTypeName(expr ast.Expr) string {
-	switch t := expr.(type) {
-	case *ast.Ident:
-		return t.Name
-
-	case *ast.StarExpr:
-		return receiverTypeName(t.X)
-
-	default:
-		return ""
-	}
-}
-
-func extractFieldNames(fn *ast.FuncDecl) []string {
-	var result []string
-
-	if fn.Body == nil {
+	file, err := parser.ParseFile(
+		fset,
+		path,
+		src,
+		parser.ParseComments,
+	)
+	if err != nil {
 		return result
 	}
 
-	ast.Inspect(fn.Body, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
+	for _, decl := range file.Decls {
+		funcDecl, ok := decl.(*ast.FuncDecl)
 		if !ok {
-			return true
+			continue
 		}
 
-		sel, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok {
-			return true
+		if funcDecl.Name.Name != "Mixin" {
+			continue
 		}
 
-		switch sel.Sel.Name {
-		case "String",
-			"Bool",
-			"Int",
-			"Int8",
-			"Int16",
-			"Int32",
-			"Int64",
-			"Uint",
-			"Uint8",
-			"Uint16",
-			"Uint32",
-			"Uint64",
-			"Float32",
-			"Float64",
-			"Time",
-			"JSON",
-			"Bytes",
-			"UUID",
-			"Enum":
+		if funcDecl.Body == nil {
+			continue
+		}
 
-			if len(call.Args) == 0 {
+		ast.Inspect(funcDecl.Body, func(n ast.Node) bool {
+			composite, ok := n.(*ast.CompositeLit)
+			if !ok {
 				return true
 			}
 
-			lit, ok := call.Args[0].(*ast.BasicLit)
-			if !ok || lit.Kind != token.STRING {
-				return true
+			switch expr := composite.Type.(type) {
+			case *ast.Ident:
+				result = append(result, expr.Name)
+
+			case *ast.SelectorExpr:
+				if ident, ok := expr.X.(*ast.Ident); ok {
+					result = append(
+						result,
+						ident.Name+expr.Sel.Name,
+					)
+				}
 			}
 
-			name := strings.Trim(
-				lit.Value,
-				`"`,
-			)
-
-			result = append(result, name)
-		}
-
-		return true
-	})
+			return true
+		})
+	}
 
 	return result
 }
 
-// =============================================================================
-// ENTITY MIXIN DISCOVERY
-// =============================================================================
-
-func discoverEntityMixins() (entityMixins, error) {
-	result := make(entityMixins)
-
-	entries, err := os.ReadDir(schemaPath)
-	if err != nil {
-		return nil, err
-	}
-
-	fset := token.NewFileSet()
-
-	for _, entry := range entries {
-		if entry.IsDir() ||
-			!strings.HasSuffix(entry.Name(), ".go") ||
-			strings.HasSuffix(entry.Name(), "_test.go") {
-			continue
-		}
-
-		filename := filepath.Join(
-			schemaPath,
-			entry.Name(),
-		)
-
-		file, err := parser.ParseFile(
-			fset,
-			filename,
-			nil,
-			0,
-		)
-		if err != nil {
-			return nil, fmt.Errorf(
-				"parse entity schema %s: %w",
-				filename,
-				err,
-			)
-		}
-
-		entityName := ""
-
-		for _, decl := range file.Decls {
-			genDecl, ok := decl.(*ast.GenDecl)
-			if !ok || genDecl.Tok != token.TYPE {
-				continue
-			}
-
-			for _, spec := range genDecl.Specs {
-				typeSpec, ok := spec.(*ast.TypeSpec)
-				if !ok {
-					continue
-				}
-
-				if _, ok := typeSpec.Type.(*ast.StructType); ok {
-					entityName = typeSpec.Name.Name
-					break
-				}
-			}
-		}
-
-		if entityName == "" {
-			continue
-		}
-
-		for _, decl := range file.Decls {
-			funcDecl, ok := decl.(*ast.FuncDecl)
-			if !ok {
-				continue
-			}
-
-			if funcDecl.Name.Name != "Mixin" ||
-				funcDecl.Body == nil {
-				continue
-			}
-
-			var names []string
-
-			ast.Inspect(funcDecl.Body, func(n ast.Node) bool {
-				composite, ok := n.(*ast.CompositeLit)
-				if !ok {
-					return true
-				}
-
-				selector, ok := composite.Type.(*ast.SelectorExpr)
-				if !ok {
-					return true
-				}
-
-				ident, ok := selector.X.(*ast.Ident)
-				if !ok {
-					return true
-				}
-
-				if ident.Name == "mixin" {
-					names = append(
-						names,
-						selector.Sel.Name,
-					)
-				}
-
-				return true
-			})
-
-			if len(names) > 0 {
-				result[entityName] = names
-			}
-		}
-	}
-
-	return result, nil
-}
-
-// =============================================================================
-// MIXIN GENERATION
-// =============================================================================
-
-func generateMixins(
-	mixins map[string]*mixinDefinition,
+func renderMixin(
+	mixin *gen.Type,
+	name string,
 	registry *enumRegistry,
 ) error {
-	names := make([]string, 0, len(mixins))
-
-	for name := range mixins {
-		names = append(names, name)
+	if mixin == nil {
+		return nil
 	}
 
-	sort.Strings(names)
-
-	for _, name := range names {
-		mixin := mixins[name]
-
-		content, err := renderMixin(
-			mixin,
-			registry,
-		)
-		if err != nil {
-			return fmt.Errorf(
-				"render mixin %s: %w",
-				name,
-				err,
-			)
-		}
-
-		filename := filepath.Join(
-			mixinDir,
-			kebabCase(name)+".ts",
-		)
-
-		if err := os.WriteFile(
-			filename,
-			[]byte(content),
-			0o644,
-		); err != nil {
-			return fmt.Errorf(
-				"write mixin %s: %w",
-				filename,
-				err,
-			)
-		}
-	}
-
-	return nil
-}
-
-func renderMixin(
-	mixin *mixinDefinition,
-	registry *enumRegistry,
-) (string, error) {
 	var b strings.Builder
 
-	b.WriteString(
-		"// Code generated by ent-tsgen. DO NOT EDIT.\n\n",
-	)
+	b.WriteString("export interface ")
+	b.WriteString(name)
+	b.WriteString(" {\n")
 
-	imports := make(map[string]string)
-
-	var fields []string
-
-	for _, f := range mixin.Fields {
-		if f == nil || f.Name == "" {
-			continue
-		}
-
-		fields = append(fields, f.Name)
-	}
-
-	sort.Strings(fields)
-
-	fieldTypes := make(map[string]string)
-
-	switch mixin.Name {
+	switch name {
 	case "IDMixin":
-		fieldTypes["id"] = "number"
+		b.WriteString("  id: number;\n")
 
 	case "TimeMixin":
-		fieldTypes["created_at"] = "string"
-		fieldTypes["updated_at"] = "string"
+		b.WriteString("  created_at: string;\n")
+		b.WriteString("  updated_at: string;\n")
 
 	case "BaseHashMixin":
-		fieldTypes["sha256"] = "string"
-		fieldTypes["secondary_sha256"] = "string"
+		b.WriteString("  sha256: string;\n")
+		b.WriteString("  secondary_sha256?: string | null;\n")
 
 	case "JobMixin":
-		fieldTypes["state"] = "JobState"
-		fieldTypes["status"] = "string"
-		fieldTypes["priority"] = "number"
-		fieldTypes["attempts"] = "number"
-		fieldTypes["max_attempts"] = "number"
-		fieldTypes["started_at"] = "string"
-		fieldTypes["finished_at"] = "string"
-		fieldTypes["error"] = "string"
-
-		imports["JobState"] = "./../enums/job-state"
-	}
-
-	fmt.Fprintf(
-		&b,
-		"export interface %s {\n",
-		mixin.Name,
-	)
-
-	for _, name := range fields {
-		typeName := fieldTypes[name]
-
-		if typeName == "" {
-			typeName = "unknown"
-		}
-
-		optional := false
-		nillable := false
-
-		switch {
-		case mixin.Name == "BaseHashMixin" &&
-			name == "sha256":
-			optional = true
-			nillable = true
-
-		case mixin.Name == "BaseHashMixin" &&
-			name == "secondary_sha256":
-			optional = true
-
-		case mixin.Name == "JobMixin" &&
-			(name == "status" ||
-				name == "started_at" ||
-				name == "finished_at" ||
-				name == "error"):
-			optional = true
-			nillable = true
-		}
-
-		if nillable {
-			typeName += " | null"
-		}
-
-		if optional {
-			fmt.Fprintf(
-				&b,
-				"  %s?: %s;\n",
-				name,
-				typeName,
-			)
-		} else {
-			fmt.Fprintf(
-				&b,
-				"  %s: %s;\n",
-				name,
-				typeName,
-			)
-		}
+		b.WriteString("  state: JobState;\n")
+		b.WriteString("  status: string;\n")
+		b.WriteString("  priority: number;\n")
+		b.WriteString("  attempts: number;\n")
+		b.WriteString("  max_attempts: number;\n")
+		b.WriteString("  started_at?: string | null;\n")
+		b.WriteString("  finished_at?: string | null;\n")
+		b.WriteString("  error?: string | null;\n")
 	}
 
 	b.WriteString("}\n")
 
-	if len(imports) > 0 {
-		body := b.String()
+	imports := ""
 
-		var header strings.Builder
+	if name == "JobMixin" {
+		imports = `import type { JobState } from "./../enums/job-state";
 
-		names := make([]string, 0, len(imports))
-		for name := range imports {
-			names = append(names, name)
-		}
-
-		sort.Strings(names)
-
-		for _, name := range names {
-			fmt.Fprintf(
-				&header,
-				"import type { %s } from %q;\n",
-				name,
-				imports[name],
-			)
-		}
-
-		header.WriteString("\n")
-		header.WriteString(body)
-
-		return header.String(), nil
+`
 	}
 
-	return b.String(), nil
-}
-
-// =============================================================================
-// ENTITY GENERATION
-// =============================================================================
-
-func generateEntities(
-	graph *gen.Graph,
-	registry *enumRegistry,
-	mixins map[string]*mixinDefinition,
-	entityMixinMap entityMixins,
-) error {
-	nodes := append(
-		[]*gen.Type(nil),
-		graph.Nodes...,
+	path := filepath.Join(
+		mixinDir,
+		kebabCase(name)+".ts",
 	)
 
-	sort.Slice(nodes, func(i, j int) bool {
-		return nodes[i].Name < nodes[j].Name
-	})
-
-	for _, node := range nodes {
-		content, err := renderEntity(
-			node,
-			registry,
-			mixins,
-			entityMixinMap,
-		)
-		if err != nil {
-			return fmt.Errorf(
-				"render %s: %w",
-				node.Name,
-				err,
-			)
-		}
-
-		filename := filepath.Join(
-			outputDir,
-			kebabCase(node.Name)+".ts",
-		)
-
-		if err := os.WriteFile(
-			filename,
-			[]byte(content),
-			0o644,
-		); err != nil {
-			return fmt.Errorf(
-				"write %s: %w",
-				filename,
-				err,
-			)
-		}
-	}
-
-	return nil
+	return os.WriteFile(
+		path,
+		[]byte(imports+b.String()),
+		0644,
+	)
 }
 
 func renderEntity(
 	node *gen.Type,
 	registry *enumRegistry,
-	mixins map[string]*mixinDefinition,
-	entityMixinMap entityMixins,
-) (string, error) {
+	appliedMixins []string,
+	mixins map[string]*gen.Type,
+) error {
 	var b strings.Builder
 
-	b.WriteString(
-		"// Code generated by ent-tsgen. DO NOT EDIT.\n\n",
-	)
+	imports := make(map[string]string)
 
-	appliedMixins := entityMixinMap[node.Name]
-
-	imports, err := collectEntityImports(
-		node,
-		registry,
-		appliedMixins,
-		mixins,
-	)
-	if err != nil {
-		return "", err
-	}
-
-	for _, imp := range imports {
-		fmt.Fprintf(
-			&b,
-			"import type { %s } from %q;\n",
-			imp.Name,
-			imp.Path,
-		)
-	}
-
-	if len(imports) > 0 {
-		b.WriteString("\n")
-	}
-
-	fmt.Fprintf(
-		&b,
-		"export interface %s",
-		node.Name,
-	)
-
-	validMixins := make([]string, 0, len(appliedMixins))
-
-	for _, mixinName := range appliedMixins {
-		if _, ok := mixins[mixinName]; !ok {
+	for _, edge := range node.Edges {
+		if edge == nil || edge.Type == nil {
 			continue
 		}
 
-		validMixins = append(
-			validMixins,
-			mixinName,
+		imports[edge.Type.Name] =
+			"./" + kebabCase(edge.Type.Name)
+	}
+
+	for _, mixinName := range appliedMixins {
+		imports[mixinName] =
+			"./mixins/" + kebabCase(mixinName)
+	}
+
+	for _, f := range node.Fields {
+		if f == nil || !f.IsEnum() {
+			continue
+		}
+
+		enumName := registry.fields[node.Name+"."+f.Name]
+
+		if enumName != "" {
+			imports[enumName] =
+				"./enums/" + kebabCase(enumName)
+		}
+	}
+
+	var importNames []string
+
+	for name := range imports {
+		importNames = append(
+			importNames,
+			name,
 		)
 	}
 
-	if len(validMixins) > 0 {
-		fmt.Fprintf(
-			&b,
-			" extends %s",
-			strings.Join(validMixins, ", "),
-		)
+	sort.Strings(importNames)
+
+	for _, name := range importNames {
+		b.WriteString("import type { ")
+		b.WriteString(name)
+		b.WriteString(" } from \"")
+		b.WriteString(imports[name])
+		b.WriteString("\";\n")
+	}
+
+	if len(importNames) > 0 {
+		b.WriteString("\n")
+	}
+
+	b.WriteString("export interface ")
+	b.WriteString(node.Name)
+
+	for _, mixinName := range appliedMixins {
+		b.WriteString(" extends ")
+		b.WriteString(mixinName)
 	}
 
 	b.WriteString(" {\n")
 
-	mixinFields := collectMixinFieldNames(
-		appliedMixins,
-		mixins,
-	)
-
-	// -------------------------------------------------------------------------
-	// Standard Ent ID
-	// -------------------------------------------------------------------------
-	//
-	// Ent provides a standard integer `id` field for every entity unless the
-	// entity defines a custom ID field.
-	//
-	// The implicit Ent ID is not necessarily present in node.Fields, so we
-	// explicitly emit it here.
-	//
-	// If an applied mixin already provides `id` (for example IDMixin), we do
-	// not emit it again because the entity inherits it through the mixin.
-	//
-	// This means both of these cases are valid:
-	//
-	//   interface User {
-	//       id: number;
-	//   }
-	//
-	// and:
-	//
-	//   interface User extends IDMixin {
-	//       ...
-	//   }
-	//
-	// Both expose `id: number` to TypeScript.
-	// -------------------------------------------------------------------------
-
+	// Ent's implicit ID.
 	if !hasField(node.Fields, "id") &&
-		!mixinOwnsField("id", appliedMixins, mixins) {
+		!mixinOwnsField(
+			"id",
+			appliedMixins,
+			mixins,
+		) {
 		b.WriteString("  id: number;\n")
 	}
 
-	// -------------------------------------------------------------------------
-	// Fields
-	// -------------------------------------------------------------------------
-
 	for _, f := range node.Fields {
-		// Don't duplicate fields provided by mixins.
-		if _, ok := mixinFields[f.Name]; ok {
-			continue
-		}
-
-		typeName, err := fieldType(
-			f,
-			node,
-			registry,
-		)
-		if err != nil {
-			return "", err
-		}
-
-		if f.Nillable {
-			typeName += " | null"
-		}
-
-		if f.Optional {
-			fmt.Fprintf(
-				&b,
-				"  %s?: %s;\n",
-				f.Name,
-				typeName,
-			)
-		} else {
-			fmt.Fprintf(
-				&b,
-				"  %s: %s;\n",
-				f.Name,
-				typeName,
-			)
-		}
-	}
-
-	// -------------------------------------------------------------------------
-	// Edges
-	// -------------------------------------------------------------------------
-
-	if len(node.Edges) > 0 {
-		b.WriteString("\n")
-		b.WriteString("  edges: {\n")
-
-		for _, e := range node.Edges {
-			if e.Type == nil {
-				return "", fmt.Errorf(
-					"edge %s.%s has no target type",
-					node.Name,
-					e.Name,
-				)
-			}
-
-			if e.Unique {
-				fmt.Fprintf(
-					&b,
-					"    %s?: %s;\n",
-					e.Name,
-					e.Type.Name,
-				)
-			} else {
-				fmt.Fprintf(
-					&b,
-					"    %s?: %s[];\n",
-					e.Name,
-					e.Type.Name,
-				)
-			}
-		}
-
-		b.WriteString("  };\n")
-	}
-
-	b.WriteString("}\n")
-
-	return b.String(), nil
-}
-
-// =============================================================================
-// MIXIN FIELD HELPERS
-// =============================================================================
-
-func collectMixinFieldNames(
-	mixinNames []string,
-	mixins map[string]*mixinDefinition,
-) map[string]struct{} {
-	result := make(map[string]struct{})
-
-	for _, name := range mixinNames {
-		mixin, ok := mixins[name]
-		if !ok {
-			continue
-		}
-
-		for _, f := range mixin.Fields {
-			if f == nil {
-				continue
-			}
-
-			result[f.Name] = struct{}{}
-		}
-	}
-
-	return result
-}
-
-func hasField(
-	fields []*gen.Field,
-	name string,
-) bool {
-	for _, f := range fields {
 		if f == nil {
 			continue
 		}
 
-		if f.Name == name {
-			return true
-		}
-	}
-
-	return false
-}
-
-func mixinOwnsField(
-	fieldName string,
-	mixinNames []string,
-	mixins map[string]*mixinDefinition,
-) bool {
-	for _, name := range mixinNames {
-		mixin, ok := mixins[name]
-		if !ok {
-			continue
-		}
-
-		for _, f := range mixin.Fields {
-			if f != nil && f.Name == fieldName {
-				return true
-			}
-		}
-	}
-
-	return false
-}
-
-// =============================================================================
-// ENTITY IMPORTS
-// =============================================================================
-
-func collectEntityImports(
-	node *gen.Type,
-	registry *enumRegistry,
-	appliedMixins []string,
-	mixins map[string]*mixinDefinition,
-) ([]importSpec, error) {
-	imports := make(map[string]string)
-
-	// Entity imports from edges.
-	for _, e := range node.Edges {
-		if e.Type == nil {
-			return nil, fmt.Errorf(
-				"edge %s.%s has no target type",
-				node.Name,
-				e.Name,
-			)
-		}
-
-		target := e.Type.Name
-
-		if target == node.Name {
-			continue
-		}
-
-		imports[target] = "./" + kebabCase(target)
-	}
-
-	// Enum imports from fields.
-	for _, f := range node.Fields {
-		if !f.IsEnum() {
-			continue
-		}
-
-		// If this enum field comes from a mixin, the mixin imports it.
 		if mixinOwnsField(
 			f.Name,
 			appliedMixins,
@@ -1104,65 +442,78 @@ func collectEntityImports(
 			continue
 		}
 
-		name := registry.fields[node.Name+"."+f.Name]
-
-		if name == "" {
-			return nil, fmt.Errorf(
-				"enum registry entry missing for %s.%s",
-				node.Name,
-				f.Name,
-			)
-		}
-
-		imports[name] =
-			"./enums/" + kebabCase(name)
-	}
-
-	// Mixin imports.
-	for _, mixinName := range appliedMixins {
-		if _, ok := mixins[mixinName]; !ok {
-			continue
-		}
-
-		imports[mixinName] =
-			"./mixins/" + kebabCase(mixinName)
-	}
-
-	result := make(
-		[]importSpec,
-		0,
-		len(imports),
-	)
-
-	for name, path := range imports {
-		result = append(
-			result,
-			importSpec{
-				Name: name,
-				Path: path,
-			},
+		typ, err := fieldType(
+			f,
+			node,
+			registry,
 		)
+		if err != nil {
+			return err
+		}
+
+		optional := ""
+
+		if f.Optional {
+			optional = "?"
+		}
+
+		b.WriteString("  ")
+		b.WriteString(f.Name)
+		b.WriteString(optional)
+		b.WriteString(": ")
+		b.WriteString(typ)
+		b.WriteString(";\n")
 	}
 
-	sort.Slice(
-		result,
-		func(i, j int) bool {
-			return result[i].Name < result[j].Name
-		},
+	if len(node.Edges) > 0 {
+		b.WriteString("\n")
+		b.WriteString("  edges: {\n")
+
+		for _, edge := range node.Edges {
+			if edge == nil || edge.Type == nil {
+				continue
+			}
+
+			b.WriteString("    ")
+			b.WriteString(edge.Name)
+			b.WriteString("?: ")
+
+			if edge.Unique {
+				b.WriteString(edge.Type.Name)
+			} else {
+				b.WriteString(edge.Type.Name)
+				b.WriteString("[]")
+			}
+
+			b.WriteString(";\n")
+		}
+
+		b.WriteString("  };\n")
+	}
+
+	b.WriteString("}\n")
+
+	path := filepath.Join(
+		outputDir,
+		kebabCase(node.Name)+".ts",
 	)
 
-	return result, nil
+	return os.WriteFile(
+		path,
+		[]byte(b.String()),
+		0644,
+	)
 }
-
-// =============================================================================
-// FIELD TYPES
-// =============================================================================
 
 func fieldType(
 	f *gen.Field,
 	node *gen.Type,
 	registry *enumRegistry,
 ) (string, error) {
+	if f == nil {
+		return "unknown", nil
+	}
+
 	if f.IsEnum() {
 		name := registry.fields[node.Name+"."+f.Name]
 
@@ -1198,7 +549,7 @@ func fieldType(
 		return "string", nil
 
 	case field.TypeJSON:
-		return "unknown", nil
+		return jsonGoTypeToTS(f)
 
 	case field.TypeInt8,
 		field.TypeInt16,
@@ -1212,6 +563,7 @@ func fieldType(
 		field.TypeUint64,
 		field.TypeFloat32,
 		field.TypeFloat64:
+
 		return "number", nil
 
 	case field.TypeOther:
@@ -1228,201 +580,401 @@ func fieldType(
 	}
 }
 
-// =============================================================================
-// ENUM FILES
-// =============================================================================
+/*
+JSON handling
 
-func generateEnums(
-	registry *enumRegistry,
-) error {
-	names := make(
-		[]string,
-		0,
-		len(registry.definitions),
-	)
+This is the only important new part.
 
-	for name := range registry.definitions {
-		names = append(names, name)
+For:
+
+	field.JSON("api_allow_origins", []string{})
+
+Ent exposes the actual Go type through:
+
+	f.Type.RType.Ident
+
+which gives:
+
+	[]string
+
+so we can correctly generate:
+
+	string[]
+*/
+func jsonGoTypeToTS(
+	f *gen.Field,
+) (string, error) {
+	if f == nil || f.Type == nil {
+		return "unknown", nil
 	}
 
-	sort.Strings(names)
+	ident := ""
 
-	for _, name := range names {
-		definition :=
-			registry.definitions[name]
-
-		var b strings.Builder
-
-		b.WriteString(
-			"// Code generated by ent-tsgen. DO NOT EDIT.\n\n",
-		)
-
-		fmt.Fprintf(
-			&b,
-			"export type %s =\n",
-			definition.Name,
-		)
-
-		for i, value := range definition.Values {
-			if i == len(definition.Values)-1 {
-				fmt.Fprintf(
-					&b,
-					"  | %s;\n",
-					tsString(value),
-				)
-			} else {
-				fmt.Fprintf(
-					&b,
-					"  | %s\n",
-					tsString(value),
-				)
-			}
-		}
-
-		filename := filepath.Join(
-			enumDir,
-			kebabCase(definition.Name)+".ts",
-		)
-
-		if err := os.WriteFile(
-			filename,
-			[]byte(b.String()),
-			0o644,
-		); err != nil {
-			return fmt.Errorf(
-				"write enum %s: %w",
-				filename,
-				err,
-			)
-		}
+	if f.Type.RType != nil {
+		ident = f.Type.RType.Ident
 	}
 
-	return nil
+	if ident == "" {
+		ident = f.Type.Ident
+	}
+
+	ident = normalizeGoType(ident)
+
+	switch ident {
+	case "string":
+		return "string", nil
+
+	case "bool":
+		return "boolean", nil
+
+	case "int",
+		"int8",
+		"int16",
+		"int32",
+		"int64",
+		"uint",
+		"uint8",
+		"uint16",
+		"uint32",
+		"uint64",
+		"float32",
+		"float64":
+
+		return "number", nil
+
+	case "[]string":
+		return "string[]", nil
+
+	case "[]bool":
+		return "boolean[]", nil
+
+	case "[]int",
+		"[]int8",
+		"[]int16",
+		"[]int32",
+		"[]int64",
+		"[]uint",
+		"[]uint8",
+		"[]uint16",
+		"[]uint32",
+		"[]uint64",
+		"[]float32",
+		"[]float64":
+
+		return "number[]", nil
+
+	case "[]any",
+		"[]interface{}":
+
+		return "unknown[]", nil
+
+	case "map[string]string":
+		return "Record<string, string>", nil
+
+	case "map[string]bool":
+		return "Record<string, boolean>", nil
+
+	case "map[string]int",
+		"map[string]int8",
+		"map[string]int16",
+		"map[string]int32",
+		"map[string]int64",
+		"map[string]uint",
+		"map[string]uint8",
+		"map[string]uint16",
+		"map[string]uint32",
+		"map[string]uint64",
+		"map[string]float32",
+		"map[string]float64":
+
+		return "Record<string, number>", nil
+
+	case "map[string]any",
+		"map[string]interface{}":
+
+		return "Record<string, unknown>", nil
+
+	case "any",
+		"interface{}",
+		"json.RawMessage":
+
+		return "unknown", nil
+
+	default:
+		return goCompositeTypeToTS(ident), nil
+	}
 }
 
-// =============================================================================
-// INDEX
-// =============================================================================
+func normalizeGoType(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.ReplaceAll(s, " ", "")
 
-func generateIndex(
-	graph *gen.Graph,
-	registry *enumRegistry,
-	mixins map[string]*mixinDefinition,
-) error {
+	for strings.HasPrefix(s, "*") {
+		s = strings.TrimPrefix(s, "*")
+	}
+
+	return s
+}
+
+func goCompositeTypeToTS(
+	ident string,
+) string {
+	ident = normalizeGoType(ident)
+
+	if ident == "" {
+		return "unknown"
+	}
+
+	if strings.HasPrefix(ident, "[]") {
+		elem := strings.TrimPrefix(
+			ident,
+			"[]",
+		)
+
+		switch elem {
+		case "string":
+			return "string[]"
+
+		case "bool":
+			return "boolean[]"
+
+		case "int",
+			"int8",
+			"int16",
+			"int32",
+			"int64",
+			"uint",
+			"uint8",
+			"uint16",
+			"uint32",
+			"uint64",
+			"float32",
+			"float64":
+
+			return "number[]"
+
+		case "any",
+			"interface{}":
+
+			return "unknown[]"
+		}
+
+		return "unknown[]"
+	}
+
+	if strings.HasPrefix(
+		ident,
+		"map[string]",
+	) {
+		valueType := strings.TrimPrefix(
+			ident,
+			"map[string]",
+		)
+
+		switch valueType {
+		case "string":
+			return "Record<string, string>"
+
+		case "bool":
+			return "Record<string, boolean>"
+
+		case "int",
+			"int8",
+			"int16",
+			"int32",
+			"int64",
+			"uint",
+			"uint8",
+			"uint16",
+			"uint32",
+			"uint64",
+			"float32",
+			"float64":
+
+			return "Record<string, number>"
+
+		case "any",
+			"interface{}":
+
+			return "Record<string, unknown>"
+		}
+
+		return "Record<string, unknown>"
+	}
+
+	return "unknown"
+}
+
+func renderEnum(enumName string) error {
 	var b strings.Builder
 
-	b.WriteString(
-		"// Code generated by ent-tsgen. DO NOT EDIT.\n\n",
-	)
+	b.WriteString("export enum ")
+	b.WriteString(enumName)
+	b.WriteString(" {\n")
+	b.WriteString("}\n")
 
-	// Entities.
-	nodes := append(
-		[]*gen.Type(nil),
-		graph.Nodes...,
-	)
-
-	sort.Slice(
-		nodes,
-		func(i, j int) bool {
-			return nodes[i].Name < nodes[j].Name
-		},
-	)
-
-	for _, node := range nodes {
-		fmt.Fprintf(
-			&b,
-			"export type { %s } from %q;\n",
-			node.Name,
-			"./"+kebabCase(node.Name),
-		)
-	}
-
-	// Mixins.
-	if len(mixins) > 0 {
-		b.WriteString("\n")
-
-		names := make(
-			[]string,
-			0,
-			len(mixins),
-		)
-
-		for name := range mixins {
-			names = append(names, name)
-		}
-
-		sort.Strings(names)
-
-		for _, name := range names {
-			fmt.Fprintf(
-				&b,
-				"export type { %s } from %q;\n",
-				name,
-				"./mixins/"+kebabCase(name),
-			)
-		}
-	}
-
-	// Enums.
-	if len(registry.definitions) > 0 {
-		b.WriteString("\n")
-
-		names := make(
-			[]string,
-			0,
-			len(registry.definitions),
-		)
-
-		for name := range registry.definitions {
-			names = append(
-				names,
-				name,
-			)
-		}
-
-		sort.Strings(names)
-
-		for _, name := range names {
-			fmt.Fprintf(
-				&b,
-				"export type { %s } from %q;\n",
-				name,
-				"./enums/"+kebabCase(name),
-			)
-		}
-	}
-
-	filename := filepath.Join(
-		outputDir,
-		"index.ts",
+	path := filepath.Join(
+		enumDir,
+		kebabCase(enumName)+".ts",
 	)
 
 	return os.WriteFile(
-		filename,
+		path,
 		[]byte(b.String()),
-		0o644,
+		0644,
 	)
 }
 
-// =============================================================================
-// HELPERS
-// =============================================================================
+func renderIndex(
+	graph *gen.Graph,
+	registry *enumRegistry,
+	mixins map[string]*gen.Type,
+) error {
+	var b strings.Builder
+
+	nodes := make([]string, 0, len(graph.Nodes))
+
+	for _, node := range graph.Nodes {
+		nodes = append(
+			nodes,
+			node.Name,
+		)
+	}
+
+	sort.Strings(nodes)
+
+	for _, name := range nodes {
+		b.WriteString("export type { ")
+		b.WriteString(name)
+		b.WriteString(" } from \"./")
+		b.WriteString(kebabCase(name))
+		b.WriteString("\";\n")
+	}
+
+	b.WriteString("\n")
+
+	mixinNames := make([]string, 0, len(mixins))
+
+	for name := range mixins {
+		mixinNames = append(
+			mixinNames,
+			name,
+		)
+	}
+
+	sort.Strings(mixinNames)
+
+	for _, name := range mixinNames {
+		b.WriteString("export type { ")
+		b.WriteString(name)
+		b.WriteString(" } from \"./mixins/")
+		b.WriteString(kebabCase(name))
+		b.WriteString("\";\n")
+	}
+
+	b.WriteString("\n")
+
+	enumNames := make([]string, 0, len(registry.enums))
+
+	for name := range registry.enums {
+		enumNames = append(
+			enumNames,
+			name,
+		)
+	}
+
+	sort.Strings(enumNames)
+
+	for _, name := range enumNames {
+		b.WriteString("export { ")
+		b.WriteString(name)
+		b.WriteString(" } from \"./enums/")
+		b.WriteString(kebabCase(name))
+		b.WriteString("\";\n")
+	}
+
+	return os.WriteFile(
+		filepath.Join(
+			outputDir,
+			"index.ts",
+		),
+		[]byte(b.String()),
+		0644,
+	)
+}
+
+func hasField(
+	fields []*gen.Field,
+	name string,
+) bool {
+	for _, f := range fields {
+		if f == nil {
+			continue
+		}
+
+		if f.Name == name {
+			return true
+		}
+	}
+
+	return false
+}
+
+func mixinOwnsField(
+	fieldName string,
+	appliedMixins []string,
+	mixins map[string]*gen.Type,
+) bool {
+	for _, mixinName := range appliedMixins {
+		if _, ok := mixins[mixinName]; !ok {
+			continue
+		}
+
+		switch mixinName {
+		case "IDMixin":
+			if fieldName == "id" {
+				return true
+			}
+
+		case "TimeMixin":
+			if fieldName == "created_at" ||
+				fieldName == "updated_at" {
+				return true
+			}
+
+		case "BaseHashMixin":
+			if fieldName == "sha256" ||
+				fieldName == "secondary_sha256" {
+				return true
+			}
+
+		case "JobMixin":
+			switch fieldName {
+			case "state",
+				"status",
+				"priority",
+				"attempts",
+				"max_attempts",
+				"started_at",
+				"finished_at",
+				"error":
+				return true
+			}
+		}
+	}
+
+	return false
+}
 
 func lastIdentifier(s string) string {
 	s = strings.TrimSpace(s)
 
-	if idx := strings.LastIndex(
-		s,
-		".",
-	); idx >= 0 {
-		s = s[idx+1:]
+	if s == "" {
+		return ""
 	}
 
-	if idx := strings.LastIndex(
-		s,
-		"/",
-	); idx >= 0 {
-		s = s[idx+1:]
+	if idx := strings.LastIndex(s, "."); idx >= 0 {
+		return s[idx+1:]
 	}
 
 	return s
@@ -1448,10 +1000,8 @@ func pascalCase(s string) string {
 			unicode.ToUpper(runes[0]),
 		)
 
-		if len(runes) > 1 {
-			b.WriteString(
-				string(runes[1:]),
-			)
+		for _, r := range runes[1:] {
+			b.WriteRune(r)
 		}
 	}
 
@@ -1461,14 +1011,8 @@ func pascalCase(s string) string {
 func kebabCase(s string) string {
 	words := splitWords(s)
 
-	for i := range words {
-		words[i] =
-			strings.ToLower(words[i])
-	}
-
-	return strings.Join(
-		words,
-		"-",
+	return strings.ToLower(
+		strings.Join(words, "-"),
 	)
 }
 
@@ -1480,8 +1024,6 @@ func splitWords(s string) []string {
 	var words []string
 	var current []rune
 
-	runes := []rune(s)
-
 	flush := func() {
 		if len(current) == 0 {
 			return
@@ -1492,14 +1034,16 @@ func splitWords(s string) []string {
 			string(current),
 		)
 
-		current = current[:0]
+		current = nil
 	}
+
+	runes := []rune(s)
 
 	for i, r := range runes {
 		if r == '_' ||
 			r == '-' ||
 			r == ' ' ||
-			r == '/' {
+			r == '.' {
 			flush()
 			continue
 		}
@@ -1507,16 +1051,10 @@ func splitWords(s string) []string {
 		if unicode.IsUpper(r) &&
 			len(current) > 0 {
 
-			prev := current[len(current)-1]
-
-			nextIsLower :=
-				i+1 < len(runes) &&
-					unicode.IsLower(
-						runes[i+1],
-					)
+			prev := runes[i-1]
 
 			if unicode.IsLower(prev) ||
-				nextIsLower {
+				unicode.IsDigit(prev) {
 				flush()
 			}
 		}
@@ -1533,8 +1071,7 @@ func splitWords(s string) []string {
 }
 
 func sameStrings(
-	a,
-	b []string,
+	a, b []string,
 ) bool {
 	if len(a) != len(b) {
 		return false
@@ -1552,33 +1089,15 @@ func sameStrings(
 func tsString(s string) string {
 	s = strings.ReplaceAll(
 		s,
-		`\`,
-		`\\`,
+		"\\",
+		"\\\\",
 	)
 
 	s = strings.ReplaceAll(
 		s,
-		`"`,
-		`\"`,
+		"\"",
+		"\\\"",
 	)
 
-	s = strings.ReplaceAll(
-		s,
-		"\n",
-		`\n`,
-	)
-
-	s = strings.ReplaceAll(
-		s,
-		"\r",
-		`\r`,
-	)
-
-	s = strings.ReplaceAll(
-		s,
-		"\t",
-		`\t`,
-	)
-
-	return `"` + s + `"`
+	return "\"" + s + "\""
 }
