@@ -271,15 +271,27 @@ func discoverEntityMixins(
 
 			switch expr := composite.Type.(type) {
 			case *ast.Ident:
-				result = append(result, expr.Name)
+				result = append(
+					result,
+					expr.Name,
+				)
 
 			case *ast.SelectorExpr:
-				if ident, ok := expr.X.(*ast.Ident); ok {
-					result = append(
-						result,
-						ident.Name+expr.Sel.Name,
-					)
-				}
+				// For:
+				//
+				//     mixin.IDMixin{}
+				//
+				// we want:
+				//
+				//     IDMixin
+				//
+				// not:
+				//
+				//     mixinIDMixin
+				result = append(
+					result,
+					expr.Sel.Name,
+				)
 			}
 
 			return true
@@ -339,7 +351,7 @@ func renderMixin(
 
 	path := filepath.Join(
 		mixinDir,
-		kebabCase(name)+".ts",
+		mixinFileName(name)+".ts",
 	)
 
 	return os.WriteFile(
@@ -370,7 +382,7 @@ func renderEntity(
 
 	for _, mixinName := range appliedMixins {
 		imports[mixinName] =
-			"./mixins/" + kebabCase(mixinName)
+			"./mixins/" + mixinFileName(mixinName)
 	}
 
 	for _, f := range node.Fields {
@@ -412,9 +424,16 @@ func renderEntity(
 	b.WriteString("export interface ")
 	b.WriteString(node.Name)
 
-	for _, mixinName := range appliedMixins {
+	if len(appliedMixins) > 0 {
 		b.WriteString(" extends ")
-		b.WriteString(mixinName)
+
+		for i, mixinName := range appliedMixins {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+
+			b.WriteString(mixinName)
+		}
 	}
 
 	b.WriteString(" {\n")
@@ -553,12 +572,10 @@ func fieldType(
 
 	case field.TypeInt8,
 		field.TypeInt16,
-		field.TypeInt32,
 		field.TypeInt,
 		field.TypeInt64,
 		field.TypeUint8,
 		field.TypeUint16,
-		field.TypeUint32,
 		field.TypeUint,
 		field.TypeUint64,
 		field.TypeFloat32,
@@ -581,9 +598,7 @@ func fieldType(
 }
 
 /*
-JSON handling
-
-This is the only important new part.
+JSON handling.
 
 For:
 
@@ -597,7 +612,7 @@ which gives:
 
 	[]string
 
-so we can correctly generate:
+so we generate:
 
 	string[]
 */
@@ -856,10 +871,7 @@ func renderIndex(
 	mixinNames := make([]string, 0, len(mixins))
 
 	for name := range mixins {
-		mixinNames = append(
-			mixinNames,
-			name,
-		)
+		mixinNames = append(mixinNames, name)
 	}
 
 	sort.Strings(mixinNames)
@@ -868,7 +880,7 @@ func renderIndex(
 		b.WriteString("export type { ")
 		b.WriteString(name)
 		b.WriteString(" } from \"./mixins/")
-		b.WriteString(kebabCase(name))
+		b.WriteString(mixinFileName(name))
 		b.WriteString("\";\n")
 	}
 
@@ -877,10 +889,7 @@ func renderIndex(
 	enumNames := make([]string, 0, len(registry.enums))
 
 	for name := range registry.enums {
-		enumNames = append(
-			enumNames,
-			name,
-		)
+		enumNames = append(enumNames, name)
 	}
 
 	sort.Strings(enumNames)
@@ -1100,4 +1109,8 @@ func tsString(s string) string {
 	)
 
 	return "\"" + s + "\""
+}
+
+func mixinFileName(name string) string {
+	return kebabCase(name)
 }
