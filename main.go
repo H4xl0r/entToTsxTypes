@@ -19,9 +19,9 @@ import (
 const (
 	// go:generate runs from the ent/ directory.
 	schemaPath = "../ent/schema"
-	outputDir  = "../frontend/types"
-	enumDir    = "../frontend/types/enums"
-	mixinDir   = "../frontend/types/mixins"
+	outputDir  = "../frontend/types/generated"
+	enumDir    = "../frontend/types/generated/enums"
+	mixinDir   = "../frontend/types/generated/mixins"
 )
 
 func main() {
